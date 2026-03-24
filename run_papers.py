@@ -27,6 +27,8 @@ def parse_folder(
     skip_images: bool = False,
     llm_only: bool = False,
     max_llm_chars: int = 80_000,
+    force_ocr: bool = False,
+    ocr_cache_dir: str = "./.ocr_cache",
 ):
     input_path  = Path(input_dir)
     output_path = Path(output_dir)
@@ -55,7 +57,12 @@ def parse_folder(
 
         t0 = time.time()
         try:
-            parser = PaperParser(str(pdf_path), image_output_dir=img_dir)
+            parser = PaperParser(
+                str(pdf_path),
+                image_output_dir=img_dir,
+                force_ocr=force_ocr,
+                ocr_cache_dir=ocr_cache_dir,
+            )
             result = parser.parse()
             elapsed = round(time.time() - t0, 1)
 
@@ -160,6 +167,8 @@ if __name__ == "__main__":
     ap.add_argument("--skip-images",  action="store_true", help="Skip image extraction (faster)")
     ap.add_argument("--llm-only",     action="store_true", help="Only save llm_context.txt per paper")
     ap.add_argument("--max-chars",    type=int, default=80_000, help="Max chars in llm_context.txt")
+    ap.add_argument("--force-ocr",    action="store_true", help="Force OCR fallback for all PDFs")
+    ap.add_argument("--ocr-cache-dir", default="./.ocr_cache", help="Directory for OCR cache")
     args = ap.parse_args()
 
     parse_folder(
@@ -168,4 +177,6 @@ if __name__ == "__main__":
         skip_images  = args.skip_images,
         llm_only     = args.llm_only,
         max_llm_chars= args.max_chars,
+        force_ocr    = args.force_ocr,
+        ocr_cache_dir= args.ocr_cache_dir,
     )
