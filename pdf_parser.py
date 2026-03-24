@@ -77,6 +77,7 @@ import json
 import os
 import re
 import statistics
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -99,7 +100,6 @@ except ImportError:
     pytesseract = None
 
 import hashlib
-import pickle
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1150,162 +1150,269 @@ def _extract_images(
 
 def _detect_scanned_pdf(spans: List[Span], doc: fitz.Document) -> bool:
     """
-    Detect if a PDF is scanned or broken using:
-      1. Very low span count (< 5 spans per page)
-      2. Abnormal character distribution (no vowels, high non-alphanumeric ratio)
+    Detect scanned/OCR-broken PDFs using:
+      1) very low span count,
+      2) abnormal character distribution,
+      3) high non-alphanumeric ratio.
     """
-    page_count = len(doc)
+    page_count = max(len(doc), 1)
     if not spans:
         return True
-    
-    if len(spans) / page_count < 5:
+
+    spans_per_page = len(spans) / page_count
+    if spans_per_page < 8:
         return True
 
-    # Check 1000 chars or all if less
-    sample_text = "".join([s.text for s in spans[:200]])
+    sample_text = "".join(s.text for s in spans[:1000])
     if not sample_text:
         return True
 
-    # High ratio of non-alphanumeric
+    total_chars = len(sample_text)
     alphanumeric = sum(1 for c in sample_text if c.isalnum())
-    if len(sample_text) > 0 and alphanumeric / len(sample_text) < 0.4:
+    alpha = sum(1 for c in sample_text if c.isalpha())
+    non_alnum_ratio = 1.0 - (alphanumeric / max(total_chars, 1))
+    if non_alnum_ratio > 0.55:
         return True
 
-    # Vowel check (common in academic papers, unless it's a very strange lang or just math)
-    vowels = sum(1 for c in sample_text.lower() if c in "aeiou")
-    if len(sample_text) > 0 and vowels / len(sample_text) < 0.05:
+    if alpha / max(total_chars, 1) < 0.25:
+        return True
+
+    gibberish_like = sum(1 for c in sample_text if not (c.isalnum() or c.isspace() or c in ".,;:!?()[]{}-_%+/\\'\""))
+    if gibberish_like / max(total_chars, 1) > 0.20:
         return True
 
     return False
 
 
-def _normalize_reversed_text(text: str) -> str:
-    """
-    Fix reversed text issues (like 'enisnatme bamuzutsart').
-    Often caused by bad OCR or right-to-left issues.
-    """
+def _normalize_ocr_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_LIGATURES)
+    text = text.replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
     words = text.split()
-    if not words:
-        return text
-    
-    # If the text looks like 'htiw' instead of 'with'
-    common_reversed = ["eht", "dna", "rof", "htiw", "gnis"]
-    rev_count = sum(1 for w in words if w.lower() in common_reversed)
-    if rev_count > 1:
-        return " ".join([w[::-1] for w in words])
-    
+    reversed_markers = {"eht", "dna", "rof", "htiw", "si", "era", "ot"}
+    if words:
+        marker_hits = sum(1 for w in words if w.lower() in reversed_markers)
+        if marker_hits >= 2:
+            candidate = " ".join(w[::-1] for w in words)
+            alpha_tokens = [t for t in re.findall(r"[A-Za-z]{3,}", candidate)]
+            if alpha_tokens:
+                vowelish = sum(1 for t in alpha_tokens if re.search(r"[aeiou]", t.lower()))
+                if vowelish / max(len(alpha_tokens), 1) > 0.75:
+                    text = candidate
     return text
 
 
-def _ocr_extract_text(doc: fitz.Document, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+def _ocr_extract_text(
+    doc: fitz.Document,
+    cache_dir: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[Span]]:
     """
-    Run OCR per page. Returns list of page results with spans.
+    OCR each page and return:
+      - page-level OCR records for caching/debugging
+      - pseudo-spans (Span objects) for downstream pipeline compatibility
     """
-    results = []
-    
-    # Initialize EasyOCR if available, else Tesseract
+    cache_root = Path(cache_dir) if cache_dir else Path(".ocr_cache")
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    results: List[Dict[str, Any]] = []
+    pseudo_spans: List[Span] = []
+
     reader = None
     if easyocr:
         try:
-            # reader = easyocr.Reader(['en'], gpu=True)
-            # To be safe in diverse environments, we'll let easyocr decide or default to CPU if GPU fails
-            reader = easyocr.Reader(['en'])
+            reader = easyocr.Reader(["en"], gpu=True)
         except Exception:
-            pass
+            try:
+                reader = easyocr.Reader(["en"], gpu=False)
+            except Exception:
+                reader = None
 
     for page_num, page in enumerate(doc):
-        # Cache check
-        cache_file = None
-        if cache_dir:
-            os.makedirs(cache_dir, exist_ok=True)
-            # Use hash of page content or just page number+path
-            page_id = hashlib.mdsafe_hex_digest(f"{doc.name}_{page_num}".encode()) if hasattr(hashlib, 'mdsafe_hex_digest') else hashlib.md5(f"{doc.name}_{page_num}".encode()).hexdigest()
-            cache_file = Path(cache_dir) / f"{page_id}.pkl"
-            if cache_file.exists():
-                try:
-                    with open(cache_file, "rb") as f:
-                        results.append(pickle.load(f))
-                    continue
-                except:
-                    pass
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+        digest = hashlib.md5(pix.samples).hexdigest()
+        cache_key = f"{digest}_p{page_num}.json"
+        cache_file = cache_root / cache_key
 
-        # Convert page to image
-        mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better OCR
-        pix = page.get_pixmap(matrix=mat)
+        if cache_file.exists():
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            page_records = cached.get("spans", [])
+            results.append({"page": page_num, "spans": page_records})
+            for r in page_records:
+                pseudo_spans.append(Span(
+                    text=_normalize_ocr_text(r["text"]),
+                    x0=float(r["bbox"][0]),
+                    y0=float(r["bbox"][1]),
+                    x1=float(r["bbox"][2]),
+                    y1=float(r["bbox"][3]),
+                    font_size=max(float(r["bbox"][3]) - float(r["bbox"][1]), 8.0),
+                    bold=False,
+                    page=page_num,
+                ))
+            continue
+
         img_pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        
-        page_spans = []
+
+        page_records: List[Dict[str, Any]] = []
         if reader:
             import numpy as np
             img_np = np.array(img_pil)
-            ocr_res = reader.readtext(img_np)
-            for (bbox, text, prob) in ocr_res:
+            for bbox, text, prob in reader.readtext(img_np):
+                clean_text = _normalize_ocr_text(text)
+                if not clean_text:
+                    continue
                 x0, y0 = bbox[0][0] / 2.0, bbox[0][1] / 2.0
                 x1, y1 = bbox[2][0] / 2.0, bbox[2][1] / 2.0
-                page_spans.append({
-                    "text": _normalize_reversed_text(text),
+                page_records.append({
+                    "text": clean_text,
                     "bbox": (x0, y0, x1, y1),
-                    "confidence": prob
+                    "confidence": float(prob),
                 })
         elif pytesseract:
             d = pytesseract.image_to_data(img_pil, output_type=pytesseract.Output.DICT)
-            for i in range(len(d['text'])):
-                if int(d['conf'][i]) > 30:
-                    x, y, w, h = d['left'][i]/2.0, d['top'][i]/2.0, d['width'][i]/2.0, d['height'][i]/2.0
-                    page_spans.append({
-                        "text": _normalize_reversed_text(d['text'][i]),
-                        "bbox": (x, y, x+w, y+h),
-                        "confidence": d['conf'][i] / 100.0
+            for i in range(len(d["text"])):
+                txt = _normalize_ocr_text(d["text"][i])
+                if not txt:
+                    continue
+                conf = float(d["conf"][i]) if str(d["conf"][i]).strip() else -1.0
+                if conf < 30:
+                    continue
+                x = float(d["left"][i]) / 2.0
+                y = float(d["top"][i]) / 2.0
+                w = float(d["width"][i]) / 2.0
+                h = float(d["height"][i]) / 2.0
+                page_records.append({
+                        "text": txt,
+                        "bbox": (x, y, x + w, y + h),
+                        "confidence": conf / 100.0,
                     })
-        
-        page_res = {"page": page_num, "spans": page_spans}
-        if cache_file:
-            with open(cache_file, "wb") as f:
-                pickle.dump(page_res, f)
-        
-        results.append(page_res)
-        
-    return results
+        else:
+            results.append({"page": page_num, "spans": []})
+            continue
+
+        page_records.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+        cache_file.write_text(json.dumps({"spans": page_records}, ensure_ascii=False), encoding="utf-8")
+        results.append({"page": page_num, "spans": page_records})
+
+        for r in page_records:
+            x0, y0, x1, y1 = r["bbox"]
+            pseudo_spans.append(Span(
+                text=r["text"],
+                x0=float(x0),
+                y0=float(y0),
+                x1=float(x1),
+                y1=float(y1),
+                font_size=max(float(y1) - float(y0), 8.0),
+                bold=False,
+                page=page_num,
+            ))
+
+    return results, pseudo_spans
 
 
 def _ocr_build_sections(ocr_results: List[Dict[str, Any]]) -> Dict[str, str]:
     """Reconstruct sections from OCR text."""
-    sections = defaultdict(list)
+    sections: Dict[str, List[str]] = defaultdict(list)
     current_heading = "preamble"
     for page in ocr_results:
-        spans = sorted(page['spans'], key=lambda s: (s['bbox'][1], s['bbox'][0]))
+        spans = sorted(page["spans"], key=lambda s: (s["bbox"][1], s["bbox"][0]))
         for sp in spans:
-            text = sp['text'].strip()
-            if not text: continue
+            text = _normalize_ocr_text(sp["text"])
+            if not text:
+                continue
             if _HEADING_RE.match(text) and len(text) < 60:
                 current_heading = text.lower()
-                if current_heading not in sections: sections[current_heading] = []
+                if current_heading not in sections:
+                    sections[current_heading] = []
                 continue
             sections[current_heading].append(text)
-    return {h: " ".join(b) for h, b in sections.items()}
+    return {h: _clean(" ".join(b)) for h, b in sections.items() if b}
 
 
 def _ocr_extract_tables(doc: fitz.Document, ocr_results: List[Dict[str, Any]]) -> List[TableResult]:
-    """Detect tables in OCR mode."""
-    results = []
+    """
+    OCR table extraction path:
+      - group OCR spans into candidate multi-column regions,
+      - reconstruct cells with whitespace geometry,
+      - fallback to a tab-delimited row reconstruction from OCR boxes.
+    """
+    results: List[TableResult] = []
+    table_counter = 0
     for page_res in ocr_results:
-        pg_num = page_res['page']
-        spans = page_res['spans']
+        pg_num = page_res["page"]
+        spans = page_res["spans"]
         width = doc[pg_num].rect.width
         fake_spans = [
-            Span(text=s['text'], x0=s['bbox'][0], y0=s['bbox'][1], x1=s['bbox'][2], y1=s['bbox'][3], 
-                 font_size=10.0, bold=False, page=pg_num)
+            Span(
+                text=_normalize_ocr_text(s["text"]),
+                x0=s["bbox"][0], y0=s["bbox"][1], x1=s["bbox"][2], y1=s["bbox"][3],
+                font_size=max(s["bbox"][3] - s["bbox"][1], 8.0),
+                bold=False,
+                page=pg_num,
+            )
             for s in spans
+            if _normalize_ocr_text(s["text"])
         ]
+        if len(fake_spans) < 6:
+            continue
+
         regions = _find_table_regions(fake_spans, width)
-        for i, region_spans in enumerate(regions):
+        for region_spans in regions:
             ws_raw = _build_whitespace_table(region_spans, pg_num)
-            if ws_raw:
+            if ws_raw is not None:
                 conf = _score_table(ws_raw)
-                if conf > 0.25:
-                    table_id = f"ocr_p{pg_num+1}_t{i+1}"
-                    caption = _find_caption(fake_spans, *ws_raw['bbox'], pg_num)
+                if conf >= 0.30:
+                    table_counter += 1
+                    table_id = f"ocr_p{pg_num+1}_t{table_counter}"
+                    caption = _find_caption(fake_spans, *ws_raw["bbox"], pg_num)
                     results.append(_grid_to_tableresult(ws_raw, table_id, caption, pg_num, conf))
+                    continue
+
+            # fallback: row clustering + x anchor bucketing
+            sorted_spans = sorted(region_spans, key=lambda s: (s.y0, s.x0))
+            rows: List[List[Span]] = []
+            current_row: List[Span] = []
+            last_y = None
+            for sp in sorted_spans:
+                if last_y is None or abs(sp.y0 - last_y) <= max(sp.height, 8.0) * 0.7:
+                    current_row.append(sp)
+                else:
+                    if current_row:
+                        rows.append(current_row)
+                    current_row = [sp]
+                last_y = sp.y0
+            if current_row:
+                rows.append(current_row)
+
+            x_anchors = sorted(set(round(s.x0 / 15) * 15 for s in region_spans))
+            if len(rows) >= 2 and len(x_anchors) >= 2:
+                grid: List[List[str]] = []
+                for row in rows:
+                    cells = [""] * len(x_anchors)
+                    for s in row:
+                        col = min(range(len(x_anchors)), key=lambda i: abs(s.x0 - x_anchors[i]))
+                        cells[col] = (cells[col] + " " + s.text).strip()
+                    grid.append(cells)
+                raw = {
+                    "grid": grid,
+                    "bbox": (
+                        min(s.x0 for s in region_spans),
+                        min(s.y0 for s in region_spans),
+                        max(s.x1 for s in region_spans),
+                        max(s.y1 for s in region_spans),
+                    ),
+                    "method": "ocr_layout",
+                    "n_rows": len(grid),
+                    "n_cols": len(grid[0]) if grid else 0,
+                }
+                conf = _score_table(raw)
+                if conf >= 0.25:
+                    table_counter += 1
+                    table_id = f"ocr_p{pg_num+1}_t{table_counter}"
+                    caption = _find_caption(fake_spans, *raw["bbox"], pg_num)
+                    results.append(_grid_to_tableresult(raw, table_id, caption, pg_num, conf))
     return results
 
 
@@ -1334,9 +1441,18 @@ class PaperParser:
         parser.export_tables_csv("./tables/")
     """
 
-    def __init__(self, pdf_path: str, image_output_dir: str = "./figures"):
+    def __init__(
+        self,
+        pdf_path: str,
+        image_output_dir: str = "./figures",
+        force_ocr: bool = False,
+        ocr_cache_dir: Optional[str] = None,
+    ):
         self.pdf_path        = str(pdf_path)
         self.image_output_dir = str(image_output_dir)
+        self.force_ocr = force_ocr
+        self.ocr_cache_dir = ocr_cache_dir or str(Path(self.image_output_dir) / ".ocr_cache")
+        self.is_scanned_pdf: bool = False
         self._result: Optional[ParseResult] = None
 
     def parse(self) -> ParseResult:
@@ -1348,30 +1464,32 @@ class PaperParser:
         # Collect page dimensions
         page_heights = {i: doc[i].rect.height for i in range(len(doc))}
 
-        # ── Span extraction ────────────────────────────────────────
         spans = _extract_spans(doc)
-        if not spans:
-            warnings.append("No text spans extracted — PDF may be scanned/image-only.")
+        self.is_scanned_pdf = bool(self.force_ocr or _detect_scanned_pdf(spans, doc))
 
-        # ── Span classification ────────────────────────────────────
-        labels = _classify_spans(spans, page_heights)
+        if self.is_scanned_pdf:
+            warnings.append("is_scanned_pdf=True; using OCR fallback pipeline.")
+            ocr_results, ocr_spans = _ocr_extract_text(doc, cache_dir=self.ocr_cache_dir)
+            spans = ocr_spans
+            if not spans:
+                warnings.append("OCR produced no text spans.")
+            sections = _ocr_build_sections(ocr_results)
+            tables = _ocr_extract_tables(doc, ocr_results)
+        else:
+            if not spans:
+                warnings.append("No text spans extracted — PDF may be scanned/image-only.")
+            labels = _classify_spans(spans, page_heights)
+            sections = _assemble_sections(spans, labels)
+            tables = _extract_all_tables(doc, self.pdf_path, spans)
 
-        # ── Section assembly ───────────────────────────────────────
-        sections = _assemble_sections(spans, labels)
-
-        # Full clean text (all sections joined)
         full_text = "\n\n".join(
             f"{'─'*4} {h.upper()} {'─'*4}\n{b}"
             for h, b in sections.items()
             if b and "reference" not in h.lower()
         )
-
-        # ── Table extraction ───────────────────────────────────────
-        tables = _extract_all_tables(doc, self.pdf_path, spans)
         if not tables:
             warnings.append("No tables detected.")
 
-        # ── Image extraction ───────────────────────────────────────
         images = _extract_images(doc, spans, self.image_output_dir, source_stem)
 
         doc.close()
@@ -1494,9 +1612,16 @@ if __name__ == "__main__":
     ap.add_argument("--json",         default=None,         help="JSON export path")
     ap.add_argument("--llm",          action="store_true",  help="Print LLM context to stdout")
     ap.add_argument("--max-chars",    type=int, default=80_000, help="Max chars for LLM context")
+    ap.add_argument("--force-ocr",    action="store_true",  help="Force OCR fallback pipeline")
+    ap.add_argument("--ocr-cache-dir", default=None,        help="Directory for OCR page cache")
     args = ap.parse_args()
 
-    parser = PaperParser(args.pdf, image_output_dir=args.images)
+    parser = PaperParser(
+        args.pdf,
+        image_output_dir=args.images,
+        force_ocr=args.force_ocr,
+        ocr_cache_dir=args.ocr_cache_dir,
+    )
     result = parser.parse()
 
     print("\n" + "═" * 60)
